@@ -1,25 +1,27 @@
-// Cloudflare Worker DDNS 中继 v1.0
-// 通过 DOMAIN_MAP 把多个域名映射到对应 zone_id,集中管理 DDNS 更新
 //
 // 环境变量:
 //   CF_API_TOKEN   (Secret)    - Cloudflare API Token,需有目标 zone 的 DNS Edit 权限
 //   SHARED_SECRET  (Secret)    - 客户端与 Worker 之间的共享 secret
-//   DOMAIN_MAP     (Plaintext) - JSON 字符串,key=完整域名,value=zone_id
+//   ALLOWED_DOMAINS     (array) - 信任的域名列表，必须是当前账号名下 ["home.example.com","nas.example.com"]
 //
 // 调用方式:
 //   POST /  Header: X-DDNS-Secret: <secret>
 //   可选 query: ?name=xxx.example.com  ?ip=1.2.3.4
 
+
+// 进程内 zone_id 缓存(zone_id 几乎不变,缓存到 isolate 重启即可)
+const zoneIdCache = new Map();
+
 export default {
   async fetch(request, env) {
-    // 只接受 POST 和 GET
+     // 只接受 POST 和 GET
     if (request.method !== 'POST' && request.method !== 'GET') {
       return json({ ok: false, error: 'method not allowed' }, 405);
     }
 
     const url = new URL(request.url);
 
-    // ① 校验共享 secret(Header 优先,query 兜底)
+     // ① 校验共享 secret(Header 优先,query 兜底)
     const secret =
       request.headers.get('X-DDNS-Secret') ||
       url.searchParams.get('secret');
@@ -27,37 +29,33 @@ export default {
       return json({ ok: false, error: 'unauthorized' }, 401);
     }
 
-    // ② 解析域名映射表
-    let domainMap;
+    // ② 解析允许列表(JSON 数组)
+    let allowedDomains;
     try {
-      domainMap = JSON.parse(env.DOMAIN_MAP);
+      allowedDomains = JSON.parse(env.ALLOWED_DOMAINS);
+      if (!Array.isArray(allowedDomains)) throw new Error('not array');
     } catch (e) {
       return json(
-        { ok: false, error: 'server misconfigured: DOMAIN_MAP invalid JSON' },
+        { ok: false, error: 'server misconfigured: ALLOWED_DOMAINS must be JSON array' },
         500
       );
     }
 
-    // ③ 确定目标域名:?name= 优先,否则取 map 第一个 key
+    // ③ 确定目标域名
     const recordName =
       url.searchParams.get('name') ||
-      Object.keys(domainMap)[0];
-
+      allowedDomains[0];
     if (!recordName) {
-      return json(
-        { ok: false, error: 'no record name provided and DOMAIN_MAP empty' },
-        400
-      );
+      return json({ ok: false, error: 'no record name and ALLOWED_DOMAINS empty' }, 400);
     }
 
-    // ④ 白名单校验
-    const zoneId = domainMap[recordName];
-    if (!zoneId) {
+    // ④ 白名单校验(精确匹配)
+    if (!allowedDomains.includes(recordName)) {
       return json(
         {
           ok: false,
           error: `domain not allowed: ${recordName}`,
-          hint: 'add it to DOMAIN_MAP env var',
+          hint: 'add it to ALLOWED_DOMAINS env var',
         },
         403
       );
@@ -69,31 +67,37 @@ export default {
     if (!clientIP) {
       return json({ ok: false, error: 'cannot determine IP' }, 400);
     }
-
     // ⑥ 判断记录类型
     const recordType = detectRecordType(clientIP);
     if (!recordType) {
       return json({ ok: false, error: 'invalid IP: ' + clientIP }, 400);
     }
 
-    // ⑦ 调用 CF API
-    const apiBase = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
-    const headers = {
+    // ⑥ 自动解析 zone_id(带缓存)
+    const apiHeaders = {
       Authorization: `Bearer ${env.CF_API_TOKEN}`,
       'Content-Type': 'application/json',
     };
+    let zoneId;
+    try {
+      zoneId = await resolveZoneId(recordName, apiHeaders);
+    } catch (e) {
+      return json(
+        { ok: false, error: 'resolve zone failed: ' + e.message },
+        502
+      );
+    }
 
-    // 查询现有记录
+    // ⑦ 调用 CF DNS API
+    const apiBase = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
+
     const listResp = await fetch(
       `${apiBase}?type=${recordType}&name=${encodeURIComponent(recordName)}`,
-      { headers }
+      { headers: apiHeaders }
     );
     const listData = await listResp.json();
     if (!listData.success) {
-      return json(
-        { ok: false, error: 'list failed', detail: listData.errors },
-        502
-      );
+      return json({ ok: false, error: 'list failed', detail: listData.errors }, 502);
     }
 
     const record = listData.result[0];
@@ -105,53 +109,32 @@ export default {
       proxied: false,
     };
 
-    // ⑧ 决策分支
+    // ⑧ 决策
     if (!record) {
-      // 不存在 → 创建
       const createResp = await fetch(apiBase, {
         method: 'POST',
-        headers,
+        headers: apiHeaders,
         body: JSON.stringify(body),
       });
       const createData = await createResp.json();
       if (!createData.success) {
-        return json(
-          { ok: false, error: 'create failed', detail: createData.errors },
-          502
-        );
+        return json({ ok: false, error: 'create failed', detail: createData.errors }, 502);
       }
-      return json({
-        ok: true,
-        action: 'created',
-        name: recordName,
-        type: recordType,
-        ip: clientIP,
-      });
+      return json({ ok: true, action: 'created', name: recordName, type: recordType, ip: clientIP, zone_id: zoneId });
     }
 
     if (record.content === clientIP) {
-      // 已是最新值 → 跳过
-      return json({
-        ok: true,
-        action: 'unchanged',
-        name: recordName,
-        type: recordType,
-        ip: clientIP,
-      });
+      return json({ ok: true, action: 'unchanged', name: recordName, type: recordType, ip: clientIP });
     }
 
-    // IP 变更 → 更新
     const updateResp = await fetch(`${apiBase}/${record.id}`, {
       method: 'PUT',
-      headers,
+      headers: apiHeaders,
       body: JSON.stringify(body),
     });
     const updateData = await updateResp.json();
     if (!updateData.success) {
-      return json(
-        { ok: false, error: 'update failed', detail: updateData.errors },
-        502
-      );
+      return json({ ok: false, error: 'update failed', detail: updateData.errors }, 502);
     }
     return json({
       ok: true,
@@ -164,17 +147,44 @@ export default {
   },
 };
 
+// 从完整域名逐级猜测根域名,反查 zone_id
+async function resolveZoneId(fqdn, apiHeaders) {
+  // 先查缓存
+  for (const [zoneName, id] of zoneIdCache.entries()) {
+    if (fqdn === zoneName || fqdn.endsWith('.' + zoneName)) {
+      return id;
+    }
+  }
+
+  // 逐级剥离子域名尝试匹配
+  // a1.home.example.com → ['a1.home.example.com', 'home.example.com', 'example.com', 'com']
+  const parts = fqdn.split('.');
+  for (let i = 0; i < parts.length - 1; i++) {
+    const candidate = parts.slice(i).join('.');
+    const resp = await fetch(
+      `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(candidate)}`,
+      { headers: apiHeaders }
+    );
+    const data = await resp.json();
+    if (!data.success) {
+      throw new Error(JSON.stringify(data.errors));
+    }
+    if (data.result && data.result.length > 0) {
+      const zoneId = data.result[0].id;
+      const zoneName = data.result[0].name;
+      zoneIdCache.set(zoneName, zoneId);   // 缓存
+      return zoneId;
+    }
+  }
+  throw new Error(`no zone found for ${fqdn}`);
+}
+
 function detectRecordType(ip) {
-  // IPv4
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
     const parts = ip.split('.').map(Number);
-    if (parts.every((p) => p >= 0 && p <= 255)) return 'A';
-    return null;
+    return parts.every(p => p >= 0 && p <= 255) ? 'A' : null;
   }
-  // IPv6:含冒号且仅含 hex / 冒号
-  if (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip)) {
-    return 'AAAA';
-  }
+  if (ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip)) return 'AAAA';
   return null;
 }
 

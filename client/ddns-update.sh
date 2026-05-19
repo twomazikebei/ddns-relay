@@ -12,7 +12,7 @@ set -u
 WORKER_URL="https://ddns-relay.your-subdomain.workers.dev"
 SECRET="REPLACE_WITH_YOUR_SHARED_SECRET"
 
-# 要更新的域名列表(留空数组则使用 Worker DOMAIN_MAP 的第一个域名)
+# 要更新的域名列表(留空数组则使用 Worker ALLOWED_DOMAINS 的第一个域名)
 DOMAINS=(
     "home.example.com"
     "nas.example.com"

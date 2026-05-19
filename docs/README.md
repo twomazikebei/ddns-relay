@@ -36,7 +36,7 @@
 |---|---|
 | API Token 不下放到家庭机器 | Token 仅存在 Cloudflare Worker 环境变量中 |
 | 客户端配置极简 | 客户端只需 URL + 共享 secret |
-| 限制操作范围到具体域名 | Worker 维护域名白名单(DOMAIN_MAP) |
+| 限制操作范围到具体域名 | Worker 维护域名白名单(ALLOWED_DOMAINS) |
 | 支持多域名、多 zone | 通过 JSON 映射表配置 |
 | IP 获取免依赖第三方 | Worker 从 `CF-Connecting-IP` 自动读取 |
 | 支持 IPv4 / IPv6 | 根据 IP 形态自动选择 A / AAAA |
@@ -64,7 +64,7 @@
 ┌──────────────────┐      HTTPS         ┌────────────────────────┐
 │  家庭设备 / 脚本  │ ─────────────────> │  Cloudflare Worker     │
 │   cron 5min      │  Header: secret    │  (持有 CF API Token)   │
-│   (Linux/Mac/Win)│  ?name=xxx&ip=xxx  │  (持有 DOMAIN_MAP)     │
+│   (Linux/Mac/Win)│  ?name=xxx&ip=xxx  │  (持有 ALLOWED_DOMAINS)     │
 └──────────────────┘                    └───────────┬────────────┘
                                                     │
                                                     │ Cloudflare DNS API
@@ -84,7 +84,7 @@
 | **客户端脚本** | 定时调用 Worker,可携带显式域名/IP,不持有 CF Token |
 | **Cloudflare Worker** | 鉴权、白名单校验、调用 CF DNS API,核心业务逻辑 |
 | **环境变量** | 加密存储 CF Token 和 SHARED_SECRET |
-| **DOMAIN_MAP** | JSON 配置,规定"哪些域名可被更新、对应哪个 zone" |
+| **ALLOWED_DOMAINS** | JSON 配置,规定"哪些域名可被更新、对应哪个 zone" |
 | **CF DNS Zone** | 实际生效的 DNS 记录 |
 
 ### 2.3 请求处理流程
@@ -98,12 +98,12 @@
    ├─ ② 校验 SHARED_SECRET (Header 或 query)
    │     失败 → 401
    │
-   ├─ ③ 解析 DOMAIN_MAP (JSON)
+   ├─ ③ 解析 ALLOWED_DOMAINS (JSON)
    │     失败 → 500 (配置错误)
    │
    ├─ ④ 确定目标域名 (?name= 或 MAP 第一个 key)
    │
-   ├─ ⑤ 白名单校验:域名是否在 DOMAIN_MAP
+   ├─ ⑤ 白名单校验:域名是否在 ALLOWED_DOMAINS
    │     失败 → 403
    │
    ├─ ⑥ 确定客户端 IP (?ip= 或 CF-Connecting-IP)
@@ -126,7 +126,7 @@
 |---|---|
 | CF API Token | ✅ 仅 Worker 加密环境变量 |
 | SHARED_SECRET | ✅ Worker 加密环境变量 + 客户端 |
-| DOMAIN_MAP | ✅ Worker 明文环境变量 |
+| ALLOWED_DOMAINS | ✅ Worker 明文环境变量 |
 | 当前公网 IP | ⚠ 客户端可见(脚本本身知道) / CF 网络可见 |
 | 域名列表 | ⚠ 客户端可见(脚本调用时使用) |
 
@@ -153,7 +153,7 @@
 | 项 | 配置 |
 |---|---|
 | Token name | `ddns-relay-token` |
-| Permissions | `Zone` - `DNS` - `Edit` (模板已预填) |
+| Permissions | `Zone` - `DNS` - `Edit、Read` |
 | Zone Resources | `Include` - `Specific zone` → 勾选所有要管理的 zone(可多选) |
 | Client IP Address Filtering | 留空(Worker 出口 IP 不固定) |
 | TTL | 留空(永不过期)或按需 |
@@ -193,7 +193,7 @@ head -c 32 /dev/urandom | base64
 
 保存这个字符串,后续 Worker 和客户端都要用到。
 
-### 3.5 规划 DOMAIN_MAP
+### 3.5 规划 ALLOWED_DOMAINS
 
 提前列出所有需要 DDNS 的子域名及其 zone:
 
@@ -251,9 +251,9 @@ wrangler secret put SHARED_SECRET
 |---|---|---|
 | `CF_API_TOKEN` | **Secret**(选 Encrypt) | 3.2 中生成的 API Token |
 | `SHARED_SECRET` | **Secret**(选 Encrypt) | 3.4 中生成的 secret |
-| `DOMAIN_MAP` | Plaintext | JSON 字符串(见下) |
+| `ALLOWED_DOMAINS` | Plaintext | JSON 字符串(见下) |
 
-`DOMAIN_MAP` 的值(**一行,不要换行**):
+`ALLOWED_DOMAINS` 的值(**一行,不要换行**):
 
 ```json
 {"home.example.com":"abc123zoneid1","nas.example.com":"abc123zoneid1","qb.another.com":"def456zoneid2"}
@@ -326,7 +326,7 @@ curl -X POST "https://ddns-relay.your-subdomain.workers.dev/?name=hack.example.c
 
 - **入口**:`export default { fetch }` 形式的 ES Modules Worker
 - **鉴权**:对比 `X-DDNS-Secret` Header(或 `?secret=` query)与环境变量
-- **白名单**:从 `DOMAIN_MAP` JSON 配置中查找域名对应的 zone_id
+- **白名单**:从 `ALLOWED_DOMAINS` JSON 配置中查找域名对应的 zone_id
 - **IP 自动获取**:`request.headers.get('CF-Connecting-IP')`
 - **类型判断**:IPv4 → A,IPv6 → AAAA
 - **决策**:CF API 查询 → 不存在则创建、IP 相同则跳过、不同则更新
@@ -405,7 +405,7 @@ GET   https://<worker-url>/      (兼容简单场景)
 
 | 参数 | 必填 | 类型 | 说明 |
 |---|---|---|---|
-| `name` | 否 | string | 要更新的完整域名;不传则使用 `DOMAIN_MAP` 的第一个 key |
+| `name` | 否 | string | 要更新的完整域名;不传则使用 `ALLOWED_DOMAINS` 的第一个 key |
 | `ip` | 否 | string | 显式 IP;不传则使用 `CF-Connecting-IP` 自动获取 |
 | `secret` | 见上 | string | 共享 secret(不建议放 query,建议用 Header) |
 
@@ -445,9 +445,9 @@ GET   https://<worker-url>/      (兼容简单场景)
 | 200 | 操作成功(包括 unchanged) |
 | 400 | 请求参数错误(IP 不合法、缺少域名) |
 | 401 | secret 错误或缺失 |
-| 403 | 域名不在 `DOMAIN_MAP` 白名单 |
+| 403 | 域名不在 `ALLOWED_DOMAINS` 白名单 |
 | 405 | 使用了非 POST/GET 方法 |
-| 500 | Worker 自身配置错误(`DOMAIN_MAP` JSON 无效) |
+| 500 | Worker 自身配置错误(`ALLOWED_DOMAINS` JSON 无效) |
 | 502 | CF API 调用失败 |
 
 ### 7.6 调用示例
@@ -475,7 +475,7 @@ curl "https://w.example.com/?name=nas.example.com&secret=$SECRET"
 
 ### 8.1 新增一个域名
 
-1. 编辑 Worker `DOMAIN_MAP` 环境变量,加一行:
+1. 编辑 Worker `ALLOWED_DOMAINS` 环境变量,加一行:
 
 ```json
 {
@@ -491,7 +491,7 @@ curl "https://w.example.com/?name=nas.example.com&secret=$SECRET"
 
 ### 8.2 删除一个域名
 
-1. 从 `DOMAIN_MAP` 移除该 key,保存
+1. 从 `ALLOWED_DOMAINS` 移除该 key,保存
 2. (可选)去 CF Dashboard 手动删除该 DNS 记录
 3. 客户端脚本移除对应条目
 
@@ -536,14 +536,14 @@ console.log(JSON.stringify({
 
 ### 8.6 配置备份建议
 
-`DOMAIN_MAP`、`SHARED_SECRET`、`CF_API_TOKEN` 三项关键配置,建议在密码管理器(1Password / Bitwarden 等)中保存一份副本,并标注:
+`ALLOWED_DOMAINS`、`SHARED_SECRET`、`CF_API_TOKEN` 三项关键配置,建议在密码管理器(1Password / Bitwarden 等)中保存一份副本,并标注:
 
 ```
 ddns-relay Worker
 ├── URL: https://ddns-relay.xxx.workers.dev
 ├── CF_API_TOKEN: (该 Token 的权限范围:edit DNS for zone X, Y)
 ├── SHARED_SECRET: ...
-└── DOMAIN_MAP: { ... }
+└── ALLOWED_DOMAINS: { ... }
 ```
 
 ---
@@ -554,7 +554,7 @@ ddns-relay Worker
 
 | 威胁 | 影响 | 对策 |
 |---|---|---|
-| 家庭设备被入侵,secret 泄露 | 攻击者可修改白名单内域名的 IP | `DOMAIN_MAP` 白名单限定操作范围;轮换 secret 后立即失效 |
+| 家庭设备被入侵,secret 泄露 | 攻击者可修改白名单内域名的 IP | `ALLOWED_DOMAINS` 白名单限定操作范围;轮换 secret 后立即失效 |
 | Worker URL 泄露 | 仍需 secret 才能调用 | secret 应足够长(≥32 字节随机) |
 | CF Token 泄露(理论上仅泄露场景:Dashboard 被入侵) | 攻击者可操作授权范围内全部 DNS | Token 仅授权特定 zone;及时轮换 |
 | 中间人篡改请求 | 篡改 IP / 域名 | HTTPS 全程加密;CF 不接受非 TLS 流量 |
@@ -566,7 +566,7 @@ ddns-relay Worker
 - [x] API Token 仅授予 **Zone DNS Edit** 权限,且 **Zone Resources 限定到特定 zone**
 - [x] SHARED_SECRET ≥ 32 字节随机熵,使用 `openssl rand` 等密码学安全 RNG 生成
 - [x] CF_API_TOKEN 和 SHARED_SECRET 设置为 **Secret 类型**(加密)
-- [x] DOMAIN_MAP 严格列出允许的域名,不要使用通配符
+- [x] ALLOWED_DOMAINS 严格列出允许的域名,不要使用通配符
 - [x] 客户端脚本文件权限 600(只有 owner 可读),防止其他用户读取
 - [x] 不要把 SHARED_SECRET 提交到 git 仓库
 - [x] 定期(如每年)轮换 SHARED_SECRET 和 CF_API_TOKEN
@@ -586,8 +586,8 @@ ddns-relay Worker
 | 现象 | 可能原因 | 排查 |
 |---|---|---|
 | 401 unauthorized | secret 不匹配 | 检查脚本和 Worker 变量是否一致;Header 拼写 `X-DDNS-Secret` |
-| 403 domain not allowed | 域名未在 DOMAIN_MAP | 检查 DOMAIN_MAP JSON 是否包含该域名 |
-| 500 DOMAIN_MAP invalid JSON | 配置 JSON 格式错误 | 用 `jq` / 在线 JSON 校验工具核对 |
+| 403 domain not allowed | 域名未在 ALLOWED_DOMAINS | 检查 ALLOWED_DOMAINS JSON 是否包含该域名 |
+| 500 ALLOWED_DOMAINS invalid JSON | 配置 JSON 格式错误 | 用 `jq` / 在线 JSON 校验工具核对 |
 | 502 list/create/update failed | CF API 调用失败 | 看 `detail` 字段;常见为 Token 权限不足或 Zone ID 错误 |
 | 客户端 curl 报超时 | Worker URL 访问不通 | 试 `curl -v https://<url>`;检查家庭网络对 workers.dev 的访问 |
 | `CF-Connecting-IP` 取到内网 IP | 客户端通过隧道/VPN 出网 | 用 `?ip=` 显式传或调整出网路径 |

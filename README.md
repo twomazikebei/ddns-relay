@@ -14,13 +14,13 @@
 ```
 家里脚本 ──(HTTPS + secret)──> CF Worker ──(CF API Token)──> 你的 DNS Zone
                                    │
-                                   └─ DOMAIN_MAP 白名单
+                                   └─ ALLOWED_DOMAINS 白名单
 ```
 
 ## 核心特性
 
 - 🔐 **API Token 不下放**:Token 仅存在 Worker 加密环境变量
-- 🛡️ **域名白名单**:`DOMAIN_MAP` 限定可被更新的域名,泄露 secret 也只能操作这些域名
+- 🛡️ **域名白名单**:`ALLOWED_DOMAINS` 限定可被更新的域名,泄露 secret 也只能操作这些域名
 - 🌐 **多域名 + 多 zone**:一个 Worker 管理多个 zone 的多条记录
 - 🤖 **自动获取 IP**:Worker 从 `CF-Connecting-IP` 自动读取,客户端无需 curl 外部 IP 服务
 - 🔀 **IPv4 / IPv6 自适应**:根据 IP 形态自动选择 A / AAAA 记录类型
@@ -49,7 +49,7 @@ wrangler secret put SHARED_SECRET    # 粘贴你生成的 secret
 |---|---|---|
 | `CF_API_TOKEN` | Secret | CF API Token(`Edit zone DNS`,授权目标 zone) |
 | `SHARED_SECRET` | Secret | 客户端共享 secret(`openssl rand -hex 32`) |
-| `DOMAIN_MAP` | Plaintext | `{"home.example.com":"<zone_id>"}` |
+| `ALLOWED_DOMAINS` | Plaintext | `["home.example.com","nas.example.com"]` |
 
 ### 3. 测试
 
@@ -86,7 +86,7 @@ Header: X-DDNS-Secret: <SHARED_SECRET>
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `name` | 否 | 要更新的完整域名,缺省取 DOMAIN_MAP 首个 |
+| `name` | 否 | 要更新的完整域名,缺省取 ALLOWED_DOMAINS 首个 |
 | `ip` | 否 | 显式 IP,缺省用 CF-Connecting-IP |
 
 响应:
