@@ -1,0 +1,21 @@
+# Wrangler 配置文件
+# 文档:https://developers.cloudflare.com/workers/wrangler/configuration/
+#
+# 部署:
+#   wrangler login
+#   wrangler secret put CF_API_TOKEN
+#   wrangler secret put SHARED_SECRET
+#   wrangler deploy
+
+name = "ddns-relay"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# 明文环境变量,通过 wrangler 部署时生效
+# 部署后也可在 Dashboard 修改,无需重新部署代码
+[vars]
+DOMAIN_MAP = '{"home.example.com":"REPLACE_WITH_YOUR_ZONE_ID"}'
+
+# Secret 不在此处声明,通过命令设置:
+#   wrangler secret put CF_API_TOKEN
+#   wrangler secret put SHARED_SECRET

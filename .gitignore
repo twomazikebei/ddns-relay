@@ -1,0 +1,23 @@
+# 敏感配置(脚本里硬编码了 secret,本地配置版不要入库)
+client/ddns-update.local.sh
+client/ddns-update.local.ps1
+client/.env
+.env
+
+# Wrangler
+worker/.wrangler/
+worker/node_modules/
+worker/.dev.vars
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

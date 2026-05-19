@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  ddns:
+    build: .
+    container_name: ddns-client
+    restart: always
+    environment:
+      # 这些变量需要通过 .env 文件或 export 注入
+      # 然后在 ddns-update.sh 中读取(本仓库脚本默认是写死配置,
+      # 容器化场景建议改造脚本读取 env)
+      TZ: Asia/Shanghai
+    volumes:
+      - ./logs:/var/log
