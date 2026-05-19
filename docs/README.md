@@ -1,6 +1,6 @@
 # Cloudflare Worker 多域名 DDNS 中继方案
 
-## 技术文档 v1.0
+## 技术文档 v1.1
 
 ---
 
@@ -37,7 +37,8 @@
 | API Token 不下放到家庭机器 | Token 仅存在 Cloudflare Worker 环境变量中 |
 | 客户端配置极简 | 客户端只需 URL + 共享 secret |
 | 限制操作范围到具体域名 | Worker 维护域名白名单(ALLOWED_DOMAINS) |
-| 支持多域名、多 zone | 通过 JSON 映射表配置 |
+| 用户配置零心智 | zone_id 由 Worker 自动反查并缓存 |
+| 支持多域名、多 zone | 单 CF 账号下任意 zone 自动支持 |
 | IP 获取免依赖第三方 | Worker 从 `CF-Connecting-IP` 自动读取 |
 | 支持 IPv4 / IPv6 | 根据 IP 形态自动选择 A / AAAA |
 | 零成本运行 | 利用 Cloudflare Worker 免费额度(10 万次/天) |
@@ -45,14 +46,24 @@
 ### 1.3 适用场景
 
 - 一个或多个家庭 / 远程站点,每个站点动态公网 IP
-- 一个或多个 Cloudflare 托管的域名(可跨多个 zone)
+- 单个 Cloudflare 账号下的一个或多个域名
 - 通过 cron / 计划任务定期(5 分钟)上报 IP
 
 ### 1.4 不适用场景
 
 - DNS 不在 Cloudflare 托管(请使用对应服务商方案)
+- 跨多个 CF 账号(需要见 11.5 多 Token 改造)
 - 需要在 Worker 之外做复杂记录管理(请考虑独立后端服务)
 - 客户端无法访问公网(Worker 必须可达)
+
+### 1.5 v1.0 → v1.1 变更
+
+| 项目 | v1.0 | v1.1 |
+|---|---|---|
+| 用户配置 | 域名 + zone_id 一对一映射 | 只配域名列表,zone_id 自动反查 |
+| 配置变量 | `DOMAIN_MAP`(JSON 对象) | `ALLOWED_DOMAINS`(JSON 数组) |
+| Token 权限 | `Zone:DNS:Edit` | `Zone:DNS:Edit` + `Zone:Zone:Read` |
+| 新增域名 | 手动查 zone_id 填入 | 加一项到列表即可 |
 
 ---
 
@@ -64,11 +75,12 @@
 ┌──────────────────┐      HTTPS         ┌────────────────────────┐
 │  家庭设备 / 脚本  │ ─────────────────> │  Cloudflare Worker     │
 │   cron 5min      │  Header: secret    │  (持有 CF API Token)   │
-│   (Linux/Mac/Win)│  ?name=xxx&ip=xxx  │  (持有 ALLOWED_DOMAINS)     │
-└──────────────────┘                    └───────────┬────────────┘
+│   (Linux/Mac/Win)│  ?name=xxx&ip=xxx  │  (持有 ALLOWED_DOMAINS)│
+└──────────────────┘                    │  (zone_id 缓存)         │
+                                        └───────────┬────────────┘
                                                     │
                                                     │ Cloudflare DNS API
-                                                    │ (查询/创建/更新)
+                                                    │ (查 zone / 查/创/改 record)
                                                     ▼
                                         ┌────────────────────────┐
                                         │  CF 托管的 DNS Zone    │
@@ -82,9 +94,10 @@
 | 组件 | 职责 |
 |---|---|
 | **客户端脚本** | 定时调用 Worker,可携带显式域名/IP,不持有 CF Token |
-| **Cloudflare Worker** | 鉴权、白名单校验、调用 CF DNS API,核心业务逻辑 |
+| **Cloudflare Worker** | 鉴权、白名单校验、zone 自动反查、调用 CF DNS API |
 | **环境变量** | 加密存储 CF Token 和 SHARED_SECRET |
-| **ALLOWED_DOMAINS** | JSON 配置,规定"哪些域名可被更新、对应哪个 zone" |
+| **ALLOWED_DOMAINS** | JSON 数组,规定"哪些域名可被更新" |
+| **zone_id 缓存** | Worker 内存中的 Map,跨请求复用 zone 反查结果 |
 | **CF DNS Zone** | 实际生效的 DNS 记录 |
 
 ### 2.3 请求处理流程
@@ -98,12 +111,12 @@
    ├─ ② 校验 SHARED_SECRET (Header 或 query)
    │     失败 → 401
    │
-   ├─ ③ 解析 ALLOWED_DOMAINS (JSON)
+   ├─ ③ 解析 ALLOWED_DOMAINS (JSON 数组)
    │     失败 → 500 (配置错误)
    │
-   ├─ ④ 确定目标域名 (?name= 或 MAP 第一个 key)
+   ├─ ④ 确定目标域名 (?name= 或数组第一个元素)
    │
-   ├─ ⑤ 白名单校验:域名是否在 ALLOWED_DOMAINS
+   ├─ ⑤ 白名单校验:精确匹配 ALLOWED_DOMAINS
    │     失败 → 403
    │
    ├─ ⑥ 确定客户端 IP (?ip= 或 CF-Connecting-IP)
@@ -112,7 +125,12 @@
    ├─ ⑦ 判断记录类型 (A / AAAA)
    │     失败 → 400
    │
-   ├─ ⑧ 调用 CF API 查询现有记录
+   ├─ ⑧ 自动反查 zone_id
+   │     先查 zoneIdCache,命中 → 直接用
+   │     未命中 → 从 FQDN 逐级剥离,试 GET /zones?name=<candidate>
+   │     仍未命中 → 502
+   │
+   ├─ ⑨ 调用 CF API 查询现有记录
    │     ├─ 不存在 → 创建 (POST) → 返回 "created"
    │     ├─ 存在且 IP 相同 → 跳过 → 返回 "unchanged"
    │     └─ 存在且 IP 不同 → 更新 (PUT) → 返回 "updated"
@@ -120,13 +138,37 @@
    └─ 返回 JSON 响应
 ```
 
-### 2.4 数据流安全边界
+### 2.4 zone_id 自动反查机制
+
+**反查策略**:从完整域名(FQDN)逐级剥离子域,直到匹配到一个 zone。
+
+例如 `a1.home.example.com`:
+
+```
+尝试 1: GET /zones?name=a1.home.example.com  →  []        未命中
+尝试 2: GET /zones?name=home.example.com     →  []        未命中
+尝试 3: GET /zones?name=example.com          →  [{id:abc, name:'example.com'}]  ✅
+       缓存 {'example.com' → 'abc'}
+       返回 zone_id = 'abc'
+```
+
+**缓存策略**:
+
+- 缓存键是 **zone 名称**(`example.com`),不是 FQDN
+- 后续查询 `nas.example.com` 时:遍历缓存,发现 FQDN 是 `example.com` 的子域 → 直接命中
+- 缓存生命周期 = Worker isolate 生命周期(通常几小时到几天)
+- isolate 重启后缓存丢失,首次查询再付一次反查代价
+
+**为什么不用 KV 持久化**:zone_id 几乎不变,且每个 isolate 自己缓存就够用。引入 KV 增加复杂度但收益甚微。
+
+### 2.5 数据流安全边界
 
 | 数据 | 存储位置 |
 |---|---|
 | CF API Token | ✅ 仅 Worker 加密环境变量 |
 | SHARED_SECRET | ✅ Worker 加密环境变量 + 客户端 |
 | ALLOWED_DOMAINS | ✅ Worker 明文环境变量 |
+| zone_id 缓存 | ⚠ Worker isolate 内存(非敏感,即使泄露也无意义) |
 | 当前公网 IP | ⚠ 客户端可见(脚本本身知道) / CF 网络可见 |
 | 域名列表 | ⚠ 客户端可见(脚本调用时使用) |
 
@@ -153,29 +195,28 @@
 | 项 | 配置 |
 |---|---|
 | Token name | `ddns-relay-token` |
-| Permissions | `Zone` - `DNS` - `Edit、Read` |
+| Permissions | `Zone` - `DNS` - `Edit`(模板已预填),**点击 + Add more**,再加 `Zone` - `Zone` - `Read` |
 | Zone Resources | `Include` - `Specific zone` → 勾选所有要管理的 zone(可多选) |
 | Client IP Address Filtering | 留空(Worker 出口 IP 不固定) |
 | TTL | 留空(永不过期)或按需 |
+
+> ⚠ **重要变更**:相比 v1.0,Token 需要新增 **`Zone:Zone:Read`** 权限。Worker 通过这个权限自动反查 zone_id,使用户配置只需要域名列表。
 
 5. **Continue to summary** → **Create Token**
 6. **立即复制并保存 Token**(关闭后无法再查看)
 
 > 推荐做法:为这套 DDNS 系统单独建一个 Token,与个人其他自动化分开,出问题时可单独吊销。
 
-### 3.3 收集 Zone ID
+### 3.3 (可选)验证 Token 权限
 
-每个要管理的域名都需要它的 Zone ID:
+```bash
+# 验证 Zone:Read 权限
+curl https://api.cloudflare.com/client/v4/zones?name=example.com \
+  -H "Authorization: Bearer <TOKEN>"
+# 期望返回该 zone 的详细信息(包含 id)
 
-1. Dashboard → 选择域名 → **Overview** 页面
-2. 右下角 **API** 区域 → 复制 **Zone ID**
-
-例如:
-
-| 域名 | Zone ID |
-|---|---|
-| `example.com` | `abc123zoneid1` |
-| `another.com` | `def456zoneid2` |
+# 验证 Zone:DNS:Edit 权限(可选,部署后用真实 zone 测)
+```
 
 ### 3.4 生成 SHARED_SECRET
 
@@ -184,8 +225,6 @@
 ```bash
 # Linux / macOS
 openssl rand -hex 32
-# 或
-head -c 32 /dev/urandom | base64
 
 # PowerShell
 [Convert]::ToBase64String((1..32 | %{Get-Random -Maximum 256}))
@@ -195,15 +234,17 @@ head -c 32 /dev/urandom | base64
 
 ### 3.5 规划 ALLOWED_DOMAINS
 
-提前列出所有需要 DDNS 的子域名及其 zone:
+提前列出所有需要 DDNS 的完整域名:
 
 ```
-home.example.com    → zone abc123zoneid1
-nas.example.com     → zone abc123zoneid1
-qb.another.com      → zone def456zoneid2
+home.example.com
+nas.example.com
+qb.another.com
 ```
 
 > 注意:**不必预先在 CF Dashboard 创建 A 记录**,Worker 第一次调用时会自动创建。
+
+> 注意:这些域名所属的 zone 必须都在 **同一个 CF 账号** 且 **都在 Token 的 Zone Resources** 授权范围内。
 
 ---
 
@@ -251,12 +292,12 @@ wrangler secret put SHARED_SECRET
 |---|---|---|
 | `CF_API_TOKEN` | **Secret**(选 Encrypt) | 3.2 中生成的 API Token |
 | `SHARED_SECRET` | **Secret**(选 Encrypt) | 3.4 中生成的 secret |
-| `ALLOWED_DOMAINS` | Plaintext | JSON 字符串(见下) |
+| `ALLOWED_DOMAINS` | Plaintext | JSON 数组(见下) |
 
 `ALLOWED_DOMAINS` 的值(**一行,不要换行**):
 
 ```json
-{"home.example.com":"abc123zoneid1","nas.example.com":"abc123zoneid1","qb.another.com":"def456zoneid2"}
+["home.example.com","nas.example.com","qb.another.com"]
 ```
 
 > ⚠ **重要**:`Secret` 类型加密存储且 Dashboard 中不可回显,只能重新设置;`Plaintext` 类型可在 Dashboard 中查看和修改。
@@ -274,23 +315,27 @@ curl -i https://ddns-relay.your-subdomain.workers.dev/
 # 期望: HTTP/2 401  {"ok":false,"error":"unauthorized"}
 ```
 
-**测试 2:鉴权成功,使用默认域名**
+**测试 2:鉴权成功,使用默认域名,验证 zone 自动反查**
 
 ```bash
 curl -X POST https://ddns-relay.your-subdomain.workers.dev/ \
      -H "X-DDNS-Secret: 你的_SHARED_SECRET"
 
 # 期望:
-# {"ok":true,"action":"created","name":"home.example.com","type":"A","ip":"x.x.x.x"}
+# {"ok":true,"action":"created","name":"home.example.com","type":"A",
+#  "ip":"x.x.x.x","zone":"example.com"}
+#
+# 注意响应里有 "zone" 字段,确认 Worker 成功反查到了 zone
 ```
 
-**测试 3:再调用一次,应跳过**
+**测试 3:再调用一次,应跳过 + 命中 zone 缓存**
 
 ```bash
 curl -X POST https://ddns-relay.your-subdomain.workers.dev/ \
      -H "X-DDNS-Secret: 你的_SHARED_SECRET"
 
 # 期望: {"ok":true,"action":"unchanged",...}
+# 此次没有调用 GET /zones,因为命中了进程内缓存
 ```
 
 **测试 4:不在白名单的域名应被拒绝**
@@ -300,6 +345,7 @@ curl -X POST "https://ddns-relay.your-subdomain.workers.dev/?name=hack.example.c
      -H "X-DDNS-Secret: 你的_SHARED_SECRET"
 
 # 期望: {"ok":false,"error":"domain not allowed: hack.example.com",...}
+# 即使 hack.example.com 在 example.com zone 内,白名单没列出就拒绝
 ```
 
 **测试 5:CF Dashboard 验证**
@@ -326,7 +372,9 @@ curl -X POST "https://ddns-relay.your-subdomain.workers.dev/?name=hack.example.c
 
 - **入口**:`export default { fetch }` 形式的 ES Modules Worker
 - **鉴权**:对比 `X-DDNS-Secret` Header(或 `?secret=` query)与环境变量
-- **白名单**:从 `ALLOWED_DOMAINS` JSON 配置中查找域名对应的 zone_id
+- **白名单**:在 `ALLOWED_DOMAINS` JSON 数组中精确匹配域名
+- **zone 反查**:`resolveZoneId(fqdn)` 函数从 FQDN 逐级剥离子域名,试 `GET /zones?name=<candidate>` 找到 zone
+- **缓存**:全局 `zoneIdCache` Map,以 zone 名称为 key
 - **IP 自动获取**:`request.headers.get('CF-Connecting-IP')`
 - **类型判断**:IPv4 → A,IPv6 → AAAA
 - **决策**:CF API 查询 → 不存在则创建、IP 相同则跳过、不同则更新
@@ -405,7 +453,7 @@ GET   https://<worker-url>/      (兼容简单场景)
 
 | 参数 | 必填 | 类型 | 说明 |
 |---|---|---|---|
-| `name` | 否 | string | 要更新的完整域名;不传则使用 `ALLOWED_DOMAINS` 的第一个 key |
+| `name` | 否 | string | 要更新的完整域名;不传则使用 `ALLOWED_DOMAINS` 的第一个 |
 | `ip` | 否 | string | 显式 IP;不传则使用 `CF-Connecting-IP` 自动获取 |
 | `secret` | 见上 | string | 共享 secret(不建议放 query,建议用 Header) |
 
@@ -420,11 +468,13 @@ GET   https://<worker-url>/      (兼容简单场景)
   "name": "home.example.com",
   "type": "A" | "AAAA",
   "ip": "1.2.3.4",
+  "zone": "example.com",
   "previous_ip": "1.2.3.0"
 }
 ```
 
-`previous_ip` 仅 `action=updated` 时返回。
+- `zone` 字段:本次操作所属的 zone 名称(由自动反查得到)
+- `previous_ip`:仅 `action=updated` 时返回
 
 失败:
 
@@ -448,7 +498,7 @@ GET   https://<worker-url>/      (兼容简单场景)
 | 403 | 域名不在 `ALLOWED_DOMAINS` 白名单 |
 | 405 | 使用了非 POST/GET 方法 |
 | 500 | Worker 自身配置错误(`ALLOWED_DOMAINS` JSON 无效) |
-| 502 | CF API 调用失败 |
+| 502 | CF API 调用失败(包括 zone 反查失败) |
 
 ### 7.6 调用示例
 
@@ -475,19 +525,24 @@ curl "https://w.example.com/?name=nas.example.com&secret=$SECRET"
 
 ### 8.1 新增一个域名
 
-1. 编辑 Worker `ALLOWED_DOMAINS` 环境变量,加一行:
+**v1.1 简化后只需一步**:
+
+1. 编辑 Worker `ALLOWED_DOMAINS` 环境变量,加一项:
 
 ```json
-{
-  "home.example.com": "abc123",
-  "nas.example.com":  "abc123",
-  "new.example.com":  "abc123"
-}
+["home.example.com","nas.example.com","new.example.com"]
 ```
 
-2. 保存,Worker 自动重新部署(无需改代码)
-3. 客户端脚本的 `DOMAINS` 数组加一行
+2. 保存,Worker 自动重新部署
+3. 客户端脚本的 `DOMAINS` 数组加一行(可选)
 4. 等下次 cron 触发,或手动跑一次验证
+
+**不需要做**:
+- ❌ 不需要查 zone_id
+- ❌ 不需要改 Worker 代码
+- ❌ 不需要在 CF Dashboard 预建 A 记录
+
+**前提**:新域名所属的 zone 必须在 Token 的 Zone Resources 授权范围内。如果是全新的 zone,需要先更新 Token 权限(见 8.6)。
 
 ### 8.2 删除一个域名
 
@@ -504,7 +559,7 @@ curl "https://w.example.com/?name=nas.example.com&secret=$SECRET"
 
 ### 8.4 轮换 CF_API_TOKEN
 
-1. CF Dashboard `My Profile → API Tokens` → 创建新 Token(同样授权)
+1. CF Dashboard `My Profile → API Tokens` → 创建新 Token(同样授权 `Zone:DNS:Edit` + `Zone:Zone:Read`)
 2. Worker 环境变量 `CF_API_TOKEN` 替换为新 Token
 3. 验证 Worker 工作正常
 4. 回到 API Tokens 页面 → **吊销**旧 Token
@@ -529,21 +584,33 @@ wrangler tail ddns-relay
 console.log(JSON.stringify({
   event: 'ddns_update',
   name: recordName,
+  zone: zoneName,
   ip: clientIP,
   action: 'updated'
 }));
 ```
 
-### 8.6 配置备份建议
+### 8.6 扩展到新 zone
+
+如果新域名属于一个**目前 Token 未授权**的 zone:
+
+1. CF Dashboard `My Profile → API Tokens` → 编辑现有 Token
+2. **Zone Resources** → 新增勾选该 zone
+3. 保存
+4. 把新域名加入 `ALLOWED_DOMAINS`
+
+> 注意:CF 的 API Token **不能在创建后修改 Zone Resources**(只能修改其他字段)。如需扩展授权 zone,需要**新建一个 Token 替换旧的**。这是 CF 的产品限制。
+
+### 8.7 配置备份建议
 
 `ALLOWED_DOMAINS`、`SHARED_SECRET`、`CF_API_TOKEN` 三项关键配置,建议在密码管理器(1Password / Bitwarden 等)中保存一份副本,并标注:
 
 ```
 ddns-relay Worker
 ├── URL: https://ddns-relay.xxx.workers.dev
-├── CF_API_TOKEN: (该 Token 的权限范围:edit DNS for zone X, Y)
+├── CF_API_TOKEN: (该 Token 的权限范围:edit DNS + read zone for X, Y)
 ├── SHARED_SECRET: ...
-└── ALLOWED_DOMAINS: { ... }
+└── ALLOWED_DOMAINS: [...]
 ```
 
 ---
@@ -560,18 +627,29 @@ ddns-relay Worker
 | 中间人篡改请求 | 篡改 IP / 域名 | HTTPS 全程加密;CF 不接受非 TLS 流量 |
 | 重放攻击 | 重发旧请求 | DDNS 场景下重放等同于"再上报一次相同 IP",影响可忽略 |
 | Worker 被高频调用刷流量 | 超过免费额度(10 万/天) | 加 IP / 频率限制(见 11.2) |
+| 攻击者拿到 secret 后尝试操作 zone 内其他记录 | 即使域名属于授权 zone,白名单外仍被拒 | `ALLOWED_DOMAINS` 严格精确匹配 |
 
-### 9.2 安全配置清单
+### 9.2 关于白名单的重要性
 
-- [x] API Token 仅授予 **Zone DNS Edit** 权限,且 **Zone Resources 限定到特定 zone**
+v1.1 的 zone_id 由 Worker 自动反查,这意味着如果**没有** `ALLOWED_DOMAINS` 白名单,攻击者拿到 secret 后只要传一个属于授权 zone 的任意域名,就能修改它。
+
+因此 **`ALLOWED_DOMAINS` 是关键安全防线**——它和 zone_id 解耦后,这层防御绝对不能放宽:
+
+- ✅ 精确匹配:`allowedDomains.includes(recordName)`
+- ❌ 不要做后缀匹配:不要写成 "凡是 `*.example.com` 都允许"
+- ❌ 不要做正则:容易写错放过攻击者
+
+### 9.3 安全配置清单
+
+- [x] API Token 授予 **Zone:DNS:Edit** + **Zone:Zone:Read**,且 **Zone Resources 限定到特定 zone**
 - [x] SHARED_SECRET ≥ 32 字节随机熵,使用 `openssl rand` 等密码学安全 RNG 生成
 - [x] CF_API_TOKEN 和 SHARED_SECRET 设置为 **Secret 类型**(加密)
-- [x] ALLOWED_DOMAINS 严格列出允许的域名,不要使用通配符
+- [x] ALLOWED_DOMAINS 严格列出允许的完整域名(精确匹配,不要用通配符)
 - [x] 客户端脚本文件权限 600(只有 owner 可读),防止其他用户读取
 - [x] 不要把 SHARED_SECRET 提交到 git 仓库
 - [x] 定期(如每年)轮换 SHARED_SECRET 和 CF_API_TOKEN
 
-### 9.3 关于 IP 信任
+### 9.4 关于 IP 信任
 
 `CF-Connecting-IP` 由 Cloudflare 边缘节点注入,**客户端无法伪造**,可信任。
 
@@ -586,9 +664,11 @@ ddns-relay Worker
 | 现象 | 可能原因 | 排查 |
 |---|---|---|
 | 401 unauthorized | secret 不匹配 | 检查脚本和 Worker 变量是否一致;Header 拼写 `X-DDNS-Secret` |
-| 403 domain not allowed | 域名未在 ALLOWED_DOMAINS | 检查 ALLOWED_DOMAINS JSON 是否包含该域名 |
-| 500 ALLOWED_DOMAINS invalid JSON | 配置 JSON 格式错误 | 用 `jq` / 在线 JSON 校验工具核对 |
-| 502 list/create/update failed | CF API 调用失败 | 看 `detail` 字段;常见为 Token 权限不足或 Zone ID 错误 |
+| 403 domain not allowed | 域名未在 ALLOWED_DOMAINS | 检查 JSON 数组是否包含该域名(精确匹配) |
+| 500 ALLOWED_DOMAINS must be JSON array | 配置格式错误 | 必须是 `["a","b"]` 形式的 JSON 数组,不是 `{"a":"b"}` 对象 |
+| 502 resolve zone failed: no zone found | Worker 无法反查 zone | 检查域名所属 zone 是否在 Token 的 Zone Resources 内 |
+| 502 resolve zone failed: 9109/9007 | Token 权限不足 | 检查 Token 是否有 `Zone:Zone:Read` 权限 |
+| 502 list/create/update failed | CF API 调用失败 | 看 `detail` 字段;常见为 Token 权限或 zone 状态 |
 | 客户端 curl 报超时 | Worker URL 访问不通 | 试 `curl -v https://<url>`;检查家庭网络对 workers.dev 的访问 |
 | `CF-Connecting-IP` 取到内网 IP | 客户端通过隧道/VPN 出网 | 用 `?ip=` 显式传或调整出网路径 |
 | Worker 显示 "Internal error" | 代码运行抛异常 | 看 Logs 实时流;一般是 fetch 抛 timeout |
@@ -607,12 +687,21 @@ curl -i https://ddns-relay.xxx.workers.dev/ -H "X-DDNS-Secret: $SECRET"
 curl https://www.cloudflare.com/cdn-cgi/trace | grep ^ip=
 ```
 
-**CF API 直接测试 Token:**
+**直接测试 Token 的 Zone:Read 权限:**
 
 ```bash
-curl https://api.cloudflare.com/client/v4/zones/<ZONE_ID> \
+curl "https://api.cloudflare.com/client/v4/zones?name=example.com" \
   -H "Authorization: Bearer $CF_API_TOKEN"
-# 成功 → Token 权限正常
+# 成功 → 应返回该 zone 的详细信息
+# 失败 (code 9109) → Token 缺少 Zone:Zone:Read 权限,需新建 Token
+```
+
+**直接测试 Token 的 Zone:DNS:Edit 权限:**
+
+```bash
+curl "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records" \
+  -H "Authorization: Bearer $CF_API_TOKEN"
+# 成功 → DNS 编辑权限正常
 ```
 
 **查看 DNS 实际生效:**
@@ -657,7 +746,7 @@ Worker 会根据 `CF-Connecting-IP` 自动识别为 A / AAAA。
 ```javascript
 // 在 Worker 顶部加,需先在 Settings → Bindings 绑定 KV namespace 为 RATE_KV
 const minIntervalMs = 30 * 1000;
-const lastKey = `last:${hash(secret)}`;
+const lastKey = `last:${hashSecret(secret)}`;
 const last = await env.RATE_KV.get(lastKey);
 if (last && Date.now() - parseInt(last) < minIntervalMs) {
   return json({ ok: false, error: 'too frequent' }, 429);
@@ -690,32 +779,53 @@ if (action === 'updated' && env.NOTIFY_WEBHOOK) {
 
 ```javascript
 const dryRun = url.searchParams.get('dryRun') === 'true';
-// ...
+// ... 反查 zone 后:
 if (dryRun) {
-  return json({ ok: true, action: 'dryrun', wouldDo: '...' });
+  return json({
+    ok: true,
+    action: 'dryrun',
+    wouldDo: { name: recordName, zone: zoneName, ip: clientIP },
+  });
 }
 ```
 
-### 11.5 多 Token 场景(跨账号 zone)
+### 11.5 跨 CF 账号的多 Token 场景
 
-如果不同 zone 属于不同 CF 账号,需要不同 Token:
+v1.1 默认设计假设所有域名属于**单个 CF 账号**。如果你有跨账号的需求,需要给每个 zone 配单独的 Token。
+
+把 `ALLOWED_DOMAINS` 改造成对象形式:
 
 ```json
 {
-  "home.example.com": { "zone": "abc...", "token": "CF_TOKEN_A" },
-  "qb.another.com":   { "zone": "def...", "token": "CF_TOKEN_B" }
+  "home.example.com": "CF_TOKEN_A",
+  "qb.another.com":   "CF_TOKEN_B"
 }
 ```
 
-代码改为:
+Worker 代码相应调整:
 
 ```javascript
-const entry = domainMap[recordName];
-const zoneId = entry.zone;
-const apiToken = env[entry.token];
+const tokenVar = allowedDomains[recordName];
+const apiToken = env[tokenVar];
 ```
 
-并新增 `CF_TOKEN_A`、`CF_TOKEN_B` 两个 Secret。
+并新增 `CF_TOKEN_A`、`CF_TOKEN_B` 两个 Secret。zone 反查时分别用对应 Token。
+
+### 11.6 KV 持久化 zone 缓存
+
+如果 Worker isolate 经常重启(高频部署、流量稀少),反查代价积累起来不小。可以用 KV 持久化:
+
+```javascript
+// 反查前先查 KV
+const cached = await env.ZONE_KV.get(`zone:${candidate}`);
+if (cached) return JSON.parse(cached);
+
+// 查到后写入 KV(7 天 TTL)
+await env.ZONE_KV.put(`zone:${zoneName}`, JSON.stringify({ zoneId, zoneName }),
+                     { expirationTtl: 7 * 24 * 3600 });
+```
+
+实际 DDNS 场景下进程内 Map 足够,这个改造仅在极端场景下有意义。
 
 ---
 
@@ -740,9 +850,24 @@ ddns-relay/
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
-| 1.0 | 2026-05-19 | 初始版本,支持多域名映射、IPv4/IPv6、白名单 |
+| 1.0 | 2026-05-19 | 初始版本,支持多域名映射(`DOMAIN_MAP` 域名→zone_id)、IPv4/IPv6、白名单 |
+| 1.1 | 2026-05-19 | zone_id 自动反查并缓存;配置简化为 `ALLOWED_DOMAINS` 域名列表;Token 新增 `Zone:Zone:Read` 权限 |
 
-## 附录 C:许可与免责
+## 附录 C:从 v1.0 升级到 v1.1
+
+如果你已经部署了 v1.0,升级步骤:
+
+1. **更新 CF API Token 权限**:CF 不支持修改已有 Token 的 Zone Resources,但可以**加权限**:
+   - Dashboard → API Tokens → 编辑现有 Token → Permissions → + Add more → `Zone` - `Zone` - `Read` → 保存
+2. **替换 Worker 代码**:用本仓库 `worker/worker.js` 的最新代码
+3. **修改环境变量**:
+   - 删除 `DOMAIN_MAP`
+   - 新增 `ALLOWED_DOMAINS`,值为 `DOMAIN_MAP` 的所有 key 组成的 JSON 数组
+4. **客户端无需改动**:协议完全兼容
+
+回滚:把 Worker 代码恢复到 v1.0,删除 `ALLOWED_DOMAINS`,恢复 `DOMAIN_MAP`。
+
+## 附录 D:许可与免责
 
 - 本方案使用 Cloudflare Workers 免费计划,请遵守 [Cloudflare Workers 服务条款](https://www.cloudflare.com/terms/)
 - 本方案不为 DNS 生效时间提供 SLA;`TTL=60` 仅供参考,实际生效受 resolver 缓存影响

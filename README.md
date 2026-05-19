@@ -14,53 +14,64 @@
 ```
 家里脚本 ──(HTTPS + secret)──> CF Worker ──(CF API Token)──> 你的 DNS Zone
                                    │
-                                   └─ ALLOWED_DOMAINS 白名单
+                                   ├─ ALLOWED_DOMAINS 白名单
+                                   └─ zone_id 自动反查
 ```
 
 ## 核心特性
 
 - 🔐 **API Token 不下放**:Token 仅存在 Worker 加密环境变量
-- 🛡️ **域名白名单**:`ALLOWED_DOMAINS` 限定可被更新的域名,泄露 secret 也只能操作这些域名
-- 🌐 **多域名 + 多 zone**:一个 Worker 管理多个 zone 的多条记录
+- 🛡️ **域名白名单**:`ALLOWED_DOMAINS` 限定可被更新的域名,泄露 secret 也只能操作白名单内域名
+- ⚙️ **零配置 zone**:zone_id 由 Worker 自动反查并缓存,用户只需配置域名列表
+- 🌐 **多域名 + 多 zone**:一个 Worker 自动支持单个 CF 账号下任意 zone 的任意子域名
 - 🤖 **自动获取 IP**:Worker 从 `CF-Connecting-IP` 自动读取,客户端无需 curl 外部 IP 服务
 - 🔀 **IPv4 / IPv6 自适应**:根据 IP 形态自动选择 A / AAAA 记录类型
 - 💰 **零成本**:Cloudflare Worker 免费版 10 万次/天,远超 DDNS 需求
 
 ## 快速开始
 
-### 1. 部署 Worker
+### 1. 准备 CF API Token
+
+`CF Dashboard → My Profile → API Tokens → Create Token` → 选 **"Edit zone DNS"** 模板,然后:
+
+- 在 Permissions 区 **+ Add more**,加一行 `Zone` - `Zone` - `Read`(自动反查 zone_id 需要)
+- Zone Resources:`Include` - `Specific zone` → 勾选所有要管理的 zone
+
+保存 Token,只显示一次。
+
+### 2. 部署 Worker
 
 ```bash
 # 使用 Wrangler CLI
 cd worker/
 wrangler login
 wrangler deploy
-wrangler secret put CF_API_TOKEN     # 粘贴你的 CF API Token
-wrangler secret put SHARED_SECRET    # 粘贴你生成的 secret
+wrangler secret put CF_API_TOKEN     # 粘贴上一步生成的 Token
+wrangler secret put SHARED_SECRET    # 粘贴你生成的 secret (openssl rand -hex 32)
 ```
 
 或在 Cloudflare Dashboard 中粘贴 [worker/worker.js](worker/worker.js) 的代码。
 
-### 2. 配置环境变量
+### 3. 配置环境变量
 
 在 Worker `Settings → Variables and Secrets` 设置:
 
 | 变量名 | 类型 | 值 |
 |---|---|---|
-| `CF_API_TOKEN` | Secret | CF API Token(`Edit zone DNS`,授权目标 zone) |
+| `CF_API_TOKEN` | Secret | CF API Token(`Zone:DNS:Edit` + `Zone:Zone:Read`) |
 | `SHARED_SECRET` | Secret | 客户端共享 secret(`openssl rand -hex 32`) |
 | `ALLOWED_DOMAINS` | Plaintext | `["home.example.com","nas.example.com"]` |
 
-### 3. 测试
+### 4. 测试
 
 ```bash
 curl -X POST https://ddns-relay.your-subdomain.workers.dev/ \
      -H "X-DDNS-Secret: <你的 SHARED_SECRET>"
 
-# 期望: {"ok":true,"action":"created","name":"home.example.com",...}
+# 期望: {"ok":true,"action":"created","name":"home.example.com","zone":"example.com",...}
 ```
 
-### 4. 部署客户端
+### 5. 部署客户端
 
 **Linux / macOS:**
 
@@ -97,9 +108,16 @@ Header: X-DDNS-Secret: <SHARED_SECRET>
   "action": "created" | "updated" | "unchanged",
   "name": "home.example.com",
   "type": "A",
-  "ip": "1.2.3.4"
+  "ip": "1.2.3.4",
+  "zone": "example.com"
 }
 ```
+
+## 新增一个域名
+
+只需一步:把域名加入 Worker 的 `ALLOWED_DOMAINS`。
+
+不需要查 zone_id,不需要改 Worker 代码,不需要在 CF Dashboard 预建 A 记录(Worker 首次调用时会自动创建)。
 
 ## 项目结构
 
@@ -128,7 +146,7 @@ ddns-relay/
 - 运维操作(新增域名、轮换 secret、查看日志)
 - 安全设计(威胁模型、配置清单)
 - 故障排查
-- 扩展指南(IPv6、频率限制、通知、多 Token)
+- 扩展指南(IPv6、频率限制、通知、多账号)
 
 ## 后续规划
 
