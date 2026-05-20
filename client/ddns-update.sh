@@ -45,9 +45,9 @@ call_worker() {
 
     # 提取关键字段(不依赖 jq)
     local ok action ip
-    ok=$(echo "$response"     | grep -oE '"ok":(true|false)' | head -1 | cut -d: -f2)
-    action=$(echo "$response" | grep -oE '"action":"[^"]+"'  | head -1 | cut -d'"' -f4)
-    ip=$(echo "$response"     | grep -oE '"ip":"[^"]+"'      | head -1 | cut -d'"' -f4)
+    ok=$(echo "$response" | grep -oE '"ok"[[:space:]]*:[[:space:]]*(true|false)' | head -1 | grep -oE '(true|false)' | head -1)
+    action=$(echo "$response" | grep -oE '"action"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"action"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    ip=$(echo "$response" | grep -oE '"ip"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"ip"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
 
     if [ "$ok" != "true" ]; then
         log "FAIL [${domain:-default}]: $response"
